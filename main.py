@@ -1,67 +1,100 @@
-import io, os, pickle, torch, librosa, uvicorn
-import numpy as np
-from fastapi import FastAPI, File, UploadFile, Form
+import os
+import torch
+import speechbrain as sb
 from speechbrain.inference.speaker import EncoderClassifier
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.responses import JSONResponse
+import shutil
+import pickle
+import librosa
+import numpy as np
+
+# --- OTTIMIZZAZIONE PER RENDER FREE (512MB RAM) ---
+torch.set_num_threads(1) # Risparmia CPU e RAM
+device = "cpu"
 
 app = FastAPI()
-classifier = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="pretrained_models/spkrec-ecapa-voxceleb")
 
+# Caricamento del modello all'avvio (più lento il boot, più veloce il riconoscimento)
+print("Caricamento modello AI...")
+classifier = EncoderClassifier.from_hparams(
+    source="speechbrain/spkrec-ecapa-voxceleb",
+    run_opts={"device": device}
+)
+
+# Percorso database
 DB_FILE = "voice_db.pkl"
-VOTES_FILE = "votes_db.pkl"
-SOGLIA_VALIDAZIONE = 3 # Numero di conferme necessarie
 
-def load_db(file):
-    if os.path.exists(file):
-        with open(file, "rb") as f: return pickle.load(f)
+def load_db():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "rb") as f:
+            return pickle.load(f)
     return {}
+
+def save_db(db):
+    with open(DB_FILE, "wb") as f:
+        pickle.dump(db, f)
+
+def get_embedding(file_path):
+    """Estrae l'impronta vocale dal file audio"""
+    signal, fs = librosa.load(file_path, sr=16000)
+    tensor = torch.tensor(signal).unsqueeze(0)
+    with torch.no_grad():
+        embedding = classifier.encode_batch(tensor)
+    return embedding.squeeze(0).cpu().numpy()
+
+@app.get("/")
+def health_check():
+    return {"status": "online", "message": "VoiceID Server is running"}
 
 @app.post("/recognize")
 async def recognize(file: UploadFile = File(...)):
-    audio_bytes = await file.read()
-    signal, fs = librosa.load(io.BytesIO(audio_bytes), sr=16000)
-    with torch.no_grad():
-        emb = classifier.encode_batch(torch.tensor(signal).unsqueeze(0))[0, 0].numpy()
+    temp_path = f"temp_{file.filename}"
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
     
-    db = load_db(DB_FILE)
-    best_match, highest_score = "Sconosciuto", 0.0
+    try:
+        current_embedding = get_embedding(temp_path)
+        db = load_db()
+        
+        best_match = "Sconosciuto"
+        max_score = 0
+        
+        for name, saved_embedding in db.items():
+            # Calcolo somiglianza tra i vettori vocali
+            score = np.dot(current_embedding, saved_embedding.T) / (
+                np.linalg.norm(current_embedding) * np.linalg.norm(saved_embedding)
+            )
+            if score > max_score:
+                max_score = float(score)
+                best_match = name
+        
+        os.remove(temp_path)
+        return {"person": best_match, "confidence": max_score}
     
-    for name, saved_emb in db.items():
-        score = np.dot(emb, saved_emb) / (np.linalg.norm(emb) * np.linalg.norm(saved_emb))
-        if score > highest_score:
-            highest_score, best_match = score, name
-    
-    return {"person": best_match, "confidence": float(highest_score)}
+    except Exception as e:
+        if os.path.exists(temp_path): os.remove(temp_path)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/learn")
-async def learn(file: UploadFile = File(...), name: str = Form(...)):
-    audio_bytes = await file.read()
-    signal, fs = librosa.load(io.BytesIO(audio_bytes), sr=16000)
-    with torch.no_grad():
-        new_emb = classifier.encode_batch(torch.tensor(signal).unsqueeze(0))[0, 0].numpy()
+async def learn(name: String = Form(...), file: UploadFile = File(...)):
+    temp_path = f"learn_{file.filename}"
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
     
-    votes = load_db(VOTES_FILE)
+    try:
+        embedding = get_embedding(temp_path)
+        db = load_db()
+        db[name] = embedding
+        save_db(db)
+        
+        os.remove(temp_path)
+        return {"message": f"Identità di {name} convalidata e salvata."}
     
-    # Se il nome non è mai stato suggerito, iniziamo il conteggio
-    if name not in votes:
-        votes[name] = {"count": 1, "embeddings": [new_emb]}
-    else:
-        votes[name]["count"] += 1
-        votes[name]["embeddings"].append(new_emb)
-    
-    # Se raggiungiamo la soglia, diventa UFFICIALE
-    if votes[name]["count"] >= SOGLIA_VALIDAZIONE:
-        db = load_db(DB_FILE)
-        # Facciamo la media di tutte le registrazioni ricevute per massima precisione
-        db[name] = np.mean(votes[name]["embeddings"], axis=0)
-        with open(DB_FILE, "wb") as f: pickle.dump(db, f)
-        del votes[name] # Rimuoviamo dai voti perché ora è ufficiale
-        msg = f"EVOLUZIONE: {name} è ora un personaggio ufficiale!"
-    else:
-        msg = f"Voto ricevuto per {name}. Manicano {SOGLIA_VALIDAZIONE - votes[name]['count']} conferme."
-
-    with open(VOTES_FILE, "wb") as f: pickle.dump(votes, f)
-    print(msg)
-    return {"status": "success", "message": msg}
+    except Exception as e:
+        if os.path.exists(temp_path): os.remove(temp_path)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
