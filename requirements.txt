@@ -2,6 +2,8 @@ fastapi
 uvicorn
 python-multipart
 speechbrain
-torch
+--find-links https://download.pytorch.org/whl/cpu/torch_stable.html
+torch==2.0.1+cpu
+torchaudio==2.0.2+cpu
 numpy
 librosa
